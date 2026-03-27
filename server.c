@@ -93,6 +93,7 @@ typedef struct {
     int      acked;
 } PendingAck;
 
+#define MAX_TP_SAMPLES 3600   /* up to 1 hour of 1-second samples */
 typedef struct {
     /* reliable stats */
     uint64_t total_sent;
@@ -103,6 +104,13 @@ typedef struct {
     /* best-effort stats */
     uint64_t be_sent;
     uint64_t be_dropped;   /* simulated drop for comparison */
+    /* throughput samples (1 per second, filled by tp_thread) */
+    uint32_t rel_tp_samples[MAX_TP_SAMPLES];
+    uint32_t be_tp_samples[MAX_TP_SAMPLES];
+    int      tp_count;
+    /* per-second counters (reset each tick) */
+    uint32_t rel_tick;
+    uint32_t be_tick;
 } Stats;
 
 /* ─────────────────────────── GLOBALS ───────────────────────────── */
@@ -114,6 +122,7 @@ static Stats      g_stats;
 static pthread_mutex_t g_pending_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_stats_lock   = PTHREAD_MUTEX_INITIALIZER;
 static volatile int g_running = 1;
+static long long    g_start_ms;        /* server start time (monotonic ms) */
 
 /* ─────────────────────────── CRC32 ─────────────────────────────── */
 static uint32_t crc32_table[256];
@@ -258,6 +267,7 @@ static int send_packet(int sock, Packet *pkt, size_t plen,
 
     pthread_mutex_lock(&g_stats_lock);
     g_stats.total_sent++;
+    g_stats.rel_tick++;
     pthread_mutex_unlock(&g_stats_lock);
     return 0;
 }
@@ -310,6 +320,7 @@ static void notify_group(uint16_t group_id, const char *message,
         if (!reliable_mode) {
             pthread_mutex_lock(&g_stats_lock);
             g_stats.be_sent++;
+            g_stats.be_tick++;
             pthread_mutex_unlock(&g_stats_lock);
         }
     }
@@ -416,9 +427,41 @@ static void *heartbeat_thread(void *arg) {
     return NULL;
 }
 
+/* ─────────────────────────── THROUGHPUT SAMPLER ────────────────── */
+static void *tp_thread(void *arg) {
+    (void)arg;
+    printf("[THREAD] Throughput sampler started (1s interval)\n");
+    while (g_running) {
+        sleep(1);
+        pthread_mutex_lock(&g_stats_lock);
+        if (g_stats.tp_count < MAX_TP_SAMPLES) {
+            g_stats.rel_tp_samples[g_stats.tp_count] = g_stats.rel_tick;
+            g_stats.be_tp_samples[g_stats.tp_count]  = g_stats.be_tick;
+            g_stats.tp_count++;
+        }
+        g_stats.rel_tick = 0;
+        g_stats.be_tick  = 0;
+        pthread_mutex_unlock(&g_stats_lock);
+    }
+    return NULL;
+}
+
 /* ─────────────────────────── STATS PRINT ───────────────────────── */
 static void print_stats(void) {
     pthread_mutex_lock(&g_stats_lock);
+    long long elapsed_ms = now_ms() - g_start_ms;
+    double elapsed_s = elapsed_ms / 1000.0;
+    /* compute avg throughput from per-second samples */
+    double rel_avg_tp = 0.0, be_avg_tp = 0.0;
+    if (g_stats.tp_count > 0) {
+        uint64_t rel_sum = 0, be_sum = 0;
+        for (int i = 0; i < g_stats.tp_count; i++) {
+            rel_sum += g_stats.rel_tp_samples[i];
+            be_sum  += g_stats.be_tp_samples[i];
+        }
+        rel_avg_tp = (double)rel_sum / g_stats.tp_count;
+        be_avg_tp  = (double)be_sum  / g_stats.tp_count;
+    }
     printf("\n┌─────────────────────────────────────────────────────┐\n");
     printf("│           PERFORMANCE STATISTICS                   │\n");
     printf("├─────────────────────────────────────────────────────┤\n");
@@ -430,6 +473,7 @@ static void print_stats(void) {
     printf("│    Retransmissions  : %8llu                      │\n", g_stats.total_retransmit);
     printf("│    Lost (gave up)   : %8llu                      │\n", g_stats.total_lost);
     printf("│    Avg Latency      : %8.2f ms                  │\n", g_stats.avg_latency_ms);
+    printf("│    Avg Throughput   : %8.1f msg/s (sampled/s)   │\n", rel_avg_tp);
     printf("├─────────────────────────────────────────────────────┤\n");
     printf("│  BEST-EFFORT UDP (simulated 20%% drop):             │\n");
     printf("│    Total Sent       : %8llu                      │\n", g_stats.be_sent);
@@ -438,6 +482,10 @@ static void print_stats(void) {
            g_stats.be_sent ? 100.0 * g_stats.be_dropped / g_stats.be_sent : 0.0);
     printf("│    Effective Deliv  : %8llu                      │\n",
            g_stats.be_sent - g_stats.be_dropped);
+    printf("│    Avg Throughput   : %8.1f msg/s (sampled/s)   │\n", be_avg_tp);
+    printf("├─────────────────────────────────────────────────────┤\n");
+    printf("│    Elapsed          : %8.1f s                   │\n", elapsed_s);
+    printf("│    Samples taken    : %8d                       │\n", g_stats.tp_count);
     printf("└─────────────────────────────────────────────────────┘\n\n");
     pthread_mutex_unlock(&g_stats_lock);
 }
@@ -609,6 +657,7 @@ int main(int argc, char *argv[]) {
     int port = (argc > 1) ? atoi(argv[1]) : DEFAULT_PORT;
     srand((unsigned)time(NULL));
     crc32_init();
+    g_start_ms = now_ms();
     memset(g_pending, 0, sizeof(g_pending));
     /* mark all as acked (available) */
     for (int i = 0; i < MAX_PENDING_ACKS; i++) g_pending[i].acked = 1;
@@ -647,10 +696,11 @@ int main(int argc, char *argv[]) {
     find_or_create_group(3, "info");
 
     /* start background threads */
-    pthread_t rt, ht, ct;
+    pthread_t rt, ht, ct, tt;
     pthread_create(&rt, NULL, retransmit_thread, NULL);
     pthread_create(&ht, NULL, heartbeat_thread, NULL);
     pthread_create(&ct, NULL, cli_thread, NULL);
+    pthread_create(&tt, NULL, tp_thread, NULL);
 
     /* main receive loop */
     uint8_t raw_buf[sizeof(Packet) + 64];

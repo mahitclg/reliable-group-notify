@@ -118,11 +118,35 @@ class Stats:
     be_dropped:       int = 0   # simulated
     # History for plotting
     history:          deque = field(default_factory=lambda: deque(maxlen=60))
+    # Throughput tracking
+    start_time:     float = field(default_factory=time.monotonic)
+    _recv_count:    int   = 0         # msgs received since last 1-second tick
+    _tp_samples:    list  = field(default_factory=list)  # one msg/s value per second
 
     def record_latency(self, ms: float):
         self.latencies_ms.append(ms)
         if len(self.latencies_ms) > 1000:
             self.latencies_ms = self.latencies_ms[-1000:]
+
+    def record_recv(self):
+        """Called on every received message (NOTIFY or BESTEFF)."""
+        self._recv_count += 1
+
+    def tick_throughput(self):
+        """Called once per second by the tracker thread — saves msg/s and resets counter."""
+        self._tp_samples.append(self._recv_count)
+        self._recv_count = 0
+
+    @property
+    def avg_throughput(self) -> float:
+        """Average msg/s across all sampled seconds."""
+        if not self._tp_samples:
+            return 0.0
+        return sum(self._tp_samples) / len(self._tp_samples)
+
+    @property
+    def elapsed(self) -> float:
+        return max(time.monotonic() - self.start_time, 0.001)
 
     @property
     def avg_latency(self) -> float:
@@ -176,6 +200,7 @@ class GroupNotificationClient:
         self._recv_thread  = None
         self._retx_thread  = None
         self._hb_thread    = None
+        self._tp_thread    = None
         self.message_log: deque = deque(maxlen=200)
 
     def next_seq(self) -> int:
@@ -262,11 +287,13 @@ class GroupNotificationClient:
                 msg = pkt.payload.decode(errors="replace")
                 self._log(f"📨 NOTIFY seq={pkt.seq_num} group={pkt.group_id} | {msg}")
                 self.send_ack(pkt.seq_num, pkt.group_id)
+                self.stats.record_recv()
                 # record latency if we can find the sent time (demo mode)
 
             elif pkt.ptype == PktType.BESTEFF:
                 msg = pkt.payload.decode(errors="replace")
                 self._log(f"📬 BEST-EFFORT seq={pkt.seq_num} group={pkt.group_id} | {msg}")
+                self.stats.record_recv()
                 # no ACK for best-effort
 
             elif pkt.ptype == PktType.ACK:
@@ -327,14 +354,22 @@ class GroupNotificationClient:
         self.message_log.append(entry)
         print(entry)
 
+    def _tp_loop(self):
+        """Ticks every second and records msg/s into stats."""
+        while self.running:
+            time.sleep(1.0)
+            self.stats.tick_throughput()
+
     def start(self):
         self.running = True
         self._recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
         self._retx_thread = threading.Thread(target=self._retx_loop, daemon=True)
         self._hb_thread   = threading.Thread(target=self._hb_loop,  daemon=True)
+        self._tp_thread   = threading.Thread(target=self._tp_loop,  daemon=True)
         self._recv_thread.start()
         self._retx_thread.start()
         self._hb_thread.start()
+        self._tp_thread.start()
 
     def stop(self):
         self.running = False
@@ -493,6 +528,10 @@ def print_performance_report(stats: Stats):
     print(f"│  Delivery:    {rel_dr:<10}│  Delivery:    {be_dr:<20}│")
     print(f"│  Avg Latency: {avg_lat:<10}│  Avg Latency: N/A (fire-forget)    │")
     print("├──────────────────────────┴──────────────────────────────────┤")
+    print(f"│  Elapsed          : {stats.elapsed:.1f}s")
+    print(f"│  Avg Throughput   : {stats.avg_throughput:.1f} msg/s  ")
+    print("│  (sampled every 1s across entire session)                   │")
+    print("├─────────────────────────────────────────────────────────────┤")
     print("│  VERDICT: Reliable UDP guarantees delivery at the cost of   │")
     print("│  ~1 RTT overhead per packet. Best-effort is faster but      │")
     print("│  loses ~20% of packets with no recovery mechanism.          │")
